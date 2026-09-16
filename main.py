@@ -1,9 +1,9 @@
 import os
 import subprocess
 import uuid
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import FileResponse
 import requests
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 
 app = FastAPI()
 
@@ -16,20 +16,38 @@ async def merge_video(audio: UploadFile = File(...), video_url: str = Form(...))
     output_path = f"/tmp/{task_id}_output.mp4"
 
     try:
-        # Save audio file
+        # 1. Save uploaded audio file
         with open(audio_path, "wb") as f:
             f.write(await audio.read())
 
-        # Clean URL format (remove extra spaces or brackets)
+        # 2. Clean URL and set User-Agent header
         clean_url = video_url.strip("[]'\" ")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
 
-        # Download video file
-        r = requests.get(clean_url, stream=True)
+        # 3. Download Video
+        response = requests.get(
+            clean_url, headers=headers, stream=True, timeout=30
+        )
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video download failed with HTTP status {response.status_code}",
+            )
+
         with open(video_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
 
-        # Fixed FFmpeg command (No stream_loop crash)
+        # Check if downloaded file is valid
+        if os.path.getsize(video_path) < 1000:
+            raise HTTPException(
+                status_code=400, detail="Downloaded video file is corrupt or empty."
+            )
+
+        # 4. FFmpeg Command (No stream_loop)
         cmd = [
             "ffmpeg",
             "-y",
@@ -49,14 +67,26 @@ async def merge_video(audio: UploadFile = File(...), video_url: str = Form(...))
             output_path,
         ]
 
-        subprocess.run(cmd, check=True)
+        process = subprocess.run(cmd, capture_output=True, text=True)
+        if process.returncode != 0:
+            raise HTTPException(
+                status_code=500, detail=f"FFmpeg Error: {process.stderr}"
+            )
 
         return FileResponse(
             output_path, media_type="video/mp4", filename="final_video.mp4"
         )
 
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     finally:
-        # Auto cleanup temporary files
+        # Cleanup temporary input files
         for path in [audio_path, video_path]:
             if os.path.exists(path):
-                os.remove(path)
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
